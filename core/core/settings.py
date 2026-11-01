@@ -26,12 +26,18 @@ load_dotenv()
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-!*5p1$hqwlt&_-(8-91vf8k3n!_jeuj#qr8-!1^n8*-a6+w(ck'
+SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-!*5p1$hqwlt&_-(8-91vf8k3n!_jeuj#qr8-!1^n8*-a6+w(ck')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', '*').split(',') if host.strip()]
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv('CSRF_TRUSTED_ORIGINS', 'https://*.railway.app,https://*.up.railway.app').split(',')
+    if origin.strip()
+]
 
 
 # Application definition
@@ -84,8 +90,10 @@ WSGI_APPLICATION = 'core.wsgi.application'
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
 import sys
+import urllib.parse
 
-DB_NAME = os.getenv('DB_NAME')
+DATABASE_URL = os.getenv('DATABASE_URL')
+DB_NAME = os.getenv('DB_NAME') or os.getenv('PGDATABASE')
 
 if 'test' in sys.argv:
     DATABASES = {
@@ -94,15 +102,27 @@ if 'test' in sys.argv:
             'NAME': ':memory:',
         }
     }
+elif DATABASE_URL:
+    url = urllib.parse.urlparse(DATABASE_URL)
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': url.path.lstrip('/'),
+            'USER': url.username or '',
+            'PASSWORD': url.password or '',
+            'HOST': url.hostname or 'localhost',
+            'PORT': str(url.port or 5432),
+        }
+    }
 elif DB_NAME:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
             'NAME': DB_NAME.strip(),
-            'USER': os.getenv('DB_USER', '').strip(),
-            'PASSWORD': os.getenv('DB_PASS', '').strip(),
-            'HOST': os.getenv('DB_HOST', 'localhost').strip(),
-            'PORT': os.getenv('DB_PORT', '5432').strip(),
+            'USER': (os.getenv('DB_USER') or os.getenv('PGUSER', '')).strip(),
+            'PASSWORD': (os.getenv('DB_PASS') or os.getenv('PGPASSWORD', '')).strip(),
+            'HOST': (os.getenv('DB_HOST') or os.getenv('PGHOST', 'localhost')).strip(),
+            'PORT': str(os.getenv('DB_PORT') or os.getenv('PGPORT', '5432')).strip(),
         }
     }
 else:
@@ -149,6 +169,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
