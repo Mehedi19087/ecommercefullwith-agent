@@ -1,142 +1,279 @@
+import json
+import logging
+import re
+import urllib.request
 from decimal import Decimal
+
+import cloudinary
+import cloudinary.uploader
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils.text import slugify
 
+from catalog.cloudinary_service import is_cloudinary_configured
 from catalog.models import Category, Product, ProductImage, ProductVariant, StockMovement
+
+logger = logging.getLogger(__name__)
+
+PANDA_CATEGORIES = [
+    {
+        "name": "Cooking Essentials",
+        "slug": "cooking-essentials",
+        "path": "cooking-essentials-467",
+    },
+    {
+        "name": "Fresh Produce",
+        "slug": "fresh-produce",
+        "path": "fresh-311",
+    },
+    {
+        "name": "Bakery",
+        "slug": "bakery",
+        "path": "bakery-235",
+    },
+    {
+        "name": "Beverages",
+        "slug": "beverages",
+        "path": "beverages-288",
+    },
+    {
+        "name": "Dairy & Breakfast",
+        "slug": "dairy-breakfast",
+        "path": "breakfast-468",
+    },
+    {
+        "name": "Snacks",
+        "slug": "snacks",
+        "path": "snacks-238",
+    },
+]
+
+
+def fetch_panda_products(cat_path: str, limit: int = 5):
+    """
+    Scrapes real products from Panda SA category page by parsing the Next.js state.
+    """
+    url = f"https://panda.sa/en/c/{cat_path}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    req = urllib.request.Request(url, headers=headers)
+    html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
+
+    tag = r'\"products\":['
+    start_idx = html.find(tag)
+    if start_idx == -1:
+        return []
+
+    pos = start_idx + len(tag)
+    chunk = html[pos : pos + 350000]
+    cleaned = chunk.replace(r'\"', '"').replace(r'\\', '\\')
+
+    products = []
+    p_pos = 0
+    seen = set()
+
+    while len(products) < limit and p_pos < len(cleaned):
+        brace_start = cleaned.find('{', p_pos)
+        if brace_start == -1:
+            break
+        depth = 0
+        in_str = False
+        brace_end = -1
+        for i in range(brace_start, len(cleaned)):
+            c = cleaned[i]
+            if c == '"' and (i == 0 or cleaned[i - 1] != '\\'):
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = i
+                        break
+        if brace_end != -1:
+            obj_str = cleaned[brace_start : brace_end + 1]
+            try:
+                obj = json.loads(obj_str)
+                name = obj.get("name")
+                varieties = obj.get("varieties", [])
+                if name and varieties and name not in seen:
+                    v = varieties[0]
+                    price = v.get("price")
+                    sku = v.get("sku")
+                    img = v.get("imageURL") or (
+                        v.get("images", [[]])[0][0] if v.get("images") else None
+                    )
+                    desc = v.get("description") or name
+                    size = v.get("size")
+                    unit = v.get("unit")
+                    options = {}
+                    if size and unit:
+                        options = {"size": f"{size} {unit}"}
+                    elif size:
+                        options = {"size": str(size)}
+
+                    if price and sku and float(price) > 0 and img:
+                        seen.add(name)
+                        img_clean = (
+                            img.replace("Ar_small.jpg", "Ar_large.jpg").split("?")[0]
+                        )
+                        products.append(
+                            {
+                                "name": name.strip(),
+                                "price": str(price),
+                                "sku": f"PANDA-{sku}",
+                                "description": desc.strip(),
+                                "options": options,
+                                "image": img_clean,
+                            }
+                        )
+            except Exception:
+                pass
+            p_pos = brace_end + 1
+        else:
+            break
+
+    return products
 
 
 class Command(BaseCommand):
-    help = "Seeds initial categories, products, variants, and stock for Bagalat Nijum."
+    help = "Scrapes live products from Panda SA and uploads images to Cloudinary."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=5,
+            help="Number of products to import per category (default: 5)",
+        )
+        parser.add_argument(
+            "--no-upload",
+            action="store_true",
+            help="Skip uploading images to Cloudinary and use direct URLs",
+        )
 
     def handle(self, *args, **options):
-        self.stdout.write("Seeding catalog data...")
+        limit = options["limit"]
+        no_upload = options["no_upload"]
 
-        categories_data = [
-            {"name": "Rice & grains", "slug": "rice"},
-            {"name": "Oil & ghee", "slug": "oil"},
-            {"name": "Spices & masala", "slug": "spices"},
-            {"name": "Fish & seafood", "slug": "fish"},
-            {"name": "Dairy & eggs", "slug": "dairy"},
-            {"name": "Snacks & noodles", "slug": "snacks"},
-        ]
+        self.stdout.write(
+            self.style.NOTICE(
+                f"Starting catalog scrape from Panda SA ({limit} products per category)..."
+            )
+        )
 
-        products_data = [
-            {
-                "category_slug": "rice",
-                "name": "Chashi Chinigura Rice",
-                "slug": "chashi-chinigura-rice",
-                "description": "Bring a familiar aroma to the table. Chinigura rice is a much-loved choice for pulao, khichuri, and special family meals.",
-                "sku": "CHASHI-1KG",
-                "options": {"size": "1 kg"},
-                "price": Decimal("18.50"),
-                "stock": 50,
-                "image": "https://www.spicevillage.eu/cdn/shop/products/chashi-indian-default-title-chashi-aromatic-rice-chinigura-1kg-25644680937626.jpg?v=1759731917",
-            },
-            {
-                "category_slug": "oil",
-                "name": "Rupchanda Soybean Oil",
-                "slug": "rupchanda-soybean-oil",
-                "description": "An everyday cooking companion, from a quick weekday stir-fry to a slow-cooked family curry.",
-                "sku": "RUPCHANDA-2L",
-                "options": {"size": "2 L"},
-                "price": Decimal("24.90"),
-                "stock": 50,
-                "image": "https://foodpanda.dhmedia.io/image/darkstores/nv-global-catalog/bd/6d9ccfea-6475-4b84-87a0-469314c54fbb.jpg?height=480",
-            },
-            {
-                "category_slug": "spices",
-                "name": "Radhuni Turmeric Powder",
-                "slug": "radhuni-turmeric-powder",
-                "description": "The golden starting point for so many familiar recipes. Add warmth and colour to your dal and curries.",
-                "sku": "RADHUNI-200G",
-                "options": {"size": "200 g"},
-                "price": Decimal("7.50"),
-                "stock": 50,
-                "image": "https://indianhouse.pl/cdn/shop/files/8_20240814_174350_0007.png?v=1749456581",
-            },
-            {
-                "category_slug": "fish",
-                "name": "Rui Fish · Bengali Cut",
-                "slug": "rui-fish-steaks",
-                "description": "For the fish curry you have been thinking about all week. Rui steaks in a traditional Bengali cut.",
-                "sku": "RUI-1KG",
-                "options": {"size": "1 kg"},
-                "price": Decimal("32.00"),
-                "stock": 50,
-                "image": "https://image.cdn.shpy.in/416209/SKU-1088_0-1759725593172.png?format=webp",
-            },
-            {
-                "category_slug": "dairy",
-                "name": "Almarai Full Fat Milk",
-                "slug": "almarai-full-fat-milk",
-                "description": "Full-fat milk from a familiar Saudi household brand. Great for tea, breakfast, and cooking.",
-                "sku": "ALMARAI-1L",
-                "options": {"size": "1 L"},
-                "price": Decimal("6.00"),
-                "stock": 50,
-                "image": "https://img.ananinja.com/media/ninja-catalog-42/Banmaly/B71/6281007120807_2.png?q=75&w=750",
-            },
-            {
-                "category_slug": "snacks",
-                "name": "Maggi Masala Noodles",
-                "slug": "maggi-masala-noodles",
-                "description": "A quick bowl of comfort for busy afternoons and late-night cravings. Classic masala noodles in an 8-pack.",
-                "sku": "MAGGI-8PACK",
-                "options": {"size": "8-pack"},
-                "price": Decimal("12.50"),
-                "stock": 50,
-                "image": "https://foodpanda.dhmedia.io/image/nv-bd/Manisha/BD5BO18U.jpg?height=480",
-            },
-        ]
+        cloudinary_active = is_cloudinary_configured() and not no_upload
+        if cloudinary_active:
+            self.stdout.write(
+                self.style.SUCCESS("Cloudinary is configured. Images will be uploaded.")
+            )
+        else:
+            self.stdout.write(
+                self.style.WARNING(
+                    "Cloudinary not active or --no-upload specified. Using direct URLs."
+                )
+            )
 
         with transaction.atomic():
-            cats = {}
-            for cd in categories_data:
-                cat, _ = Category.objects.get_or_create(
-                    slug=cd["slug"],
-                    defaults={"name": cd["name"], "is_active": True},
-                )
-                cats[cd["slug"]] = cat
+            self.stdout.write("Deleting old hardcoded products and categories...")
+            StockMovement.objects.all().delete()
+            ProductImage.objects.all().delete()
+            ProductVariant.objects.all().delete()
+            Product.objects.all().delete()
+            Category.objects.all().delete()
 
-            for pd in products_data:
-                category = cats[pd["category_slug"]]
-                product, _ = Product.objects.get_or_create(
-                    slug=pd["slug"],
-                    defaults={
-                        "category": category,
-                        "name": pd["name"],
-                        "description": pd["description"],
-                        "is_active": True,
-                    },
+            total_imported = 0
+
+            for cat_data in PANDA_CATEGORIES:
+                self.stdout.write(f"\nFetching category: {cat_data['name']}...")
+                category = Category.objects.create(
+                    name=cat_data["name"],
+                    slug=cat_data["slug"],
+                    is_active=True,
                 )
 
-                variant, created_var = ProductVariant.objects.get_or_create(
-                    sku=pd["sku"],
-                    defaults={
-                        "product": product,
-                        "options": pd["options"],
-                        "price": pd["price"],
-                        "stock_quantity": pd["stock"],
-                        "is_active": True,
-                    },
+                try:
+                    scraped_items = fetch_panda_products(cat_data["path"], limit=limit)
+                except Exception as exc:
+                    self.stdout.write(
+                        self.style.ERROR(
+                            f"Failed to fetch {cat_data['name']}: {exc}"
+                        )
+                    )
+                    continue
+
+                self.stdout.write(
+                    f"Found {len(scraped_items)} items for {cat_data['name']}."
                 )
 
-                if created_var and pd["stock"] > 0:
-                    StockMovement.objects.create(
-                        variant=variant,
-                        quantity_change=pd["stock"],
-                        reason=StockMovement.Reason.RECEIVED,
-                        note="Initial stock seeding",
+                for item in scraped_items:
+                    raw_slug = slugify(item["name"])[:160]
+                    clean_slug = f"{raw_slug}-{item['sku'].lower()}"
+
+                    product = Product.objects.create(
+                        category=category,
+                        name=item["name"],
+                        slug=clean_slug,
+                        description=item["description"],
+                        is_active=True,
                     )
 
-                ProductImage.objects.get_or_create(
-                    product=product,
-                    variant=variant,
-                    defaults={
-                        "image_url": pd["image"],
-                        "alt_text": pd["name"],
-                        "position": 0,
-                    },
-                )
+                    variant = ProductVariant.objects.create(
+                        product=product,
+                        sku=item["sku"],
+                        options=item["options"],
+                        price=Decimal(item["price"]),
+                        stock_quantity=50,
+                        is_active=True,
+                    )
 
-        self.stdout.write(self.style.SUCCESS("Catalog data successfully seeded!"))
+                    StockMovement.objects.create(
+                        variant=variant,
+                        quantity_change=50,
+                        reason=StockMovement.Reason.RECEIVED,
+                        note="Initial stock from Panda SA",
+                    )
+
+                    image_url = item["image"]
+                    if cloudinary_active:
+                        try:
+                            self.stdout.write(
+                                f"  Uploading image for {item['name'][:30]}..."
+                            )
+                            res = cloudinary.uploader.upload(
+                                item["image"],
+                                folder="ecommerce/products",
+                                resource_type="image",
+                            )
+                            image_url = res.get("secure_url") or image_url
+                        except Exception as upload_err:
+                            self.stdout.write(
+                                self.style.WARNING(
+                                    f"  Cloudinary upload failed ({upload_err}). Falling back to direct URL."
+                                )
+                            )
+
+                    ProductImage.objects.create(
+                        product=product,
+                        variant=variant,
+                        image_url=image_url,
+                        alt_text=item["name"][:200],
+                        position=0,
+                    )
+
+                    total_imported += 1
+                    self.stdout.write(
+                        f"  + Added: {item['name'][:40]} (SAR {item['price']})"
+                    )
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"\nSuccessfully seeded {total_imported} real products from Panda SA!"
+            )
+        )
