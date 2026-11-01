@@ -1,0 +1,12 @@
+.git
+.venv
+.playwright-mcp
+**/__pycache__
+**/*.py[cod]
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.sqlite3
+**/media
+**/staticfiles
